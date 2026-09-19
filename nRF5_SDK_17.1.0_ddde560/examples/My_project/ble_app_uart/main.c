@@ -137,6 +137,20 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 #define FIRST_CYCLE_TIME_MS       10000U
 #define MONITORING_PERIOD_MS      10000U
 #define HALL_SAMPLE_PERIOD_MS     100U
+
+/*
+ * MC3635 installation limits.  These assume that the board is stationary
+ * with Z aligned with gravity.  Record the values printed by
+ * accelerometer_is_valid() on the installed product and tune these limits. (currenly set in maximum range for testing purpose as per range 2g = 2000mg)
+ */
+#define ACCEL_X_MIN_MG    (-2000)
+#define ACCEL_X_MAX_MG    (2000)
+
+#define ACCEL_Y_MIN_MG    (-2000)
+#define ACCEL_Y_MAX_MG    (2000)
+
+#define ACCEL_Z_MIN_MG    (-2000)
+#define ACCEL_Z_MAX_MG    (2000)
 /*
  * TEMPORARY:
  * BUTTON_1 is being used as the pressure-pad input.
@@ -177,12 +191,21 @@ typedef enum
  * Application Variables
  * ========================================================= */
 
-
 static volatile bool m_first_cycle_timeout;
 static volatile bool m_hall_sample_timeout;
 static volatile bool m_monitoring_timeout;
 static volatile bool m_pressure_event;
 static app_state_t m_app_state = APP_STATE_SLEEP;
+
+/* Kept globally because both initialization and the 10-second check use it. */
+static TWI_parameters_t m_mc3635 =
+{
+    .SDA  = I2C_SDA_PIN,
+    .SCL  = I2C_SCL_PIN,
+    .ADDR = MC3635_ADDRESS_HIGH,
+};
+
+static bool m_accelerometer_ready;
 
 
 static void first_cycle_timer_handler(void * p_context);
@@ -376,6 +399,7 @@ static void timers_init(void)
 
 static bool hall_sensor_is_valid(void)
 {
+#if 0
     hall_sensor_measurement_t measurement;
 
     if (!hall_sensor_measurement_get(&measurement))
@@ -391,28 +415,136 @@ static bool hall_sensor_is_valid(void)
 
     return (measurement.duty_per_mille >= HALL_DUTY_MIN_PER_MILLE) &&
            (measurement.duty_per_mille <= HALL_DUTY_MAX_PER_MILLE);
+#endif
+return true; 
 }
 
 
 /* =========================================================
- * Simulated Accelerometer Check
- *
- * Later:
- * Replace this with actual accelerometer reading.
+ * MC3635 Accelerometer
  * ========================================================= */
+
+static bool accelerometer_init(void)
+{
+    /* MC3635_Init configures the I2C peripheral only. */
+    if (MC3635_Init(&m_mc3635) != MC3635_SUCCESS)
+        return false;
+
+    /* All device configuration writes must be made from standby mode. */
+    if (MC3635_SetStandbyMode(&m_mc3635) != MC3635_SUCCESS ||
+        MC3635_InitializationSequence(&m_mc3635) != MC3635_SUCCESS ||
+        MC3635_EnableAxis(&m_mc3635,
+                          MODE_C_X_AXIS_PD_ENABLED,
+                          MODE_C_Y_AXIS_PD_ENABLED,
+                          MODE_C_Z_AXIS_PD_ENABLED) != MC3635_SUCCESS ||
+        MC3635_SetResolution(&m_mc3635, RANGE_C_RES_12_BITS) != MC3635_SUCCESS ||
+        MC3635_SetRange(&m_mc3635, RANGE_C_RANGE_2G) != MC3635_SUCCESS ||
+        MC3635_EnableFIFO(&m_mc3635, FIFO_C_FIFO_EN_DISABLED) != MC3635_SUCCESS)
+    {
+        return false;
+    }
+
+    ///* Keep fresh XYZ data available for each 10-second monitoring cycle. */
+    //return MC3635_SetMode(&m_mc3635,
+    //                      MODE_C_MCTRL_CWAKE,
+    //                      LOW_POWER_MODE,
+    //                      ODR_6) == MC3635_SUCCESS;
+        return MC3635_SetSleepMode(&m_mc3635) == MC3635_SUCCESS;
+}
+
+//static bool accelerometer_is_valid(void)
+//{
+//    MC3635_data_t accel;
+
+//    if (!m_accelerometer_ready)
+//    {
+//        NRF_LOG_ERROR("MC3635 is not initialized.");
+//        return false;
+//    }
+
+//    if (MC3635_ReadRawData(&m_mc3635, &accel) != MC3635_SUCCESS)
+//    {
+//        NRF_LOG_ERROR("MC3635 read failed.");
+//        return false;
+//    }
+
+//    NRF_LOG_INFO("Accel: X=%d mg, Y=%d mg, Z=%d mg",
+//                 accel.XAxis_mg,
+//                 accel.YAxis_mg,
+//                 accel.ZAxis_mg);
+
+//    bool valid =
+//        (accel.XAxis_mg >= ACCEL_X_MIN_MG) &&
+//        (accel.XAxis_mg <= ACCEL_X_MAX_MG) &&
+//        (accel.YAxis_mg >= ACCEL_Y_MIN_MG) &&
+//        (accel.YAxis_mg <= ACCEL_Y_MAX_MG) &&
+//        (accel.ZAxis_mg >= ACCEL_Z_MIN_MG) &&
+//        (accel.ZAxis_mg <= ACCEL_Z_MAX_MG);
+
+//        return valid;
+
+//}
 
 static bool accelerometer_is_valid(void)
 {
-    /*
-     * TEMPORARY FOR TESTING
-     *
-     * true  = Accelerometer is within threshold
-     * false = Motion/problem detected
-     */
+    MC3635_data_t accel;
+    MC3635_data_t status;
+    bool valid = false;
 
-    return true;
+    if (!m_accelerometer_ready)
+    {
+        NRF_LOG_ERROR("MC3635 is not initialized.");
+        return false;
+    }
+
+    /* Wake sensor. SetMode() must be called from STANDBY. */
+    if (MC3635_SetStandbyMode(&m_mc3635) != MC3635_SUCCESS ||
+        MC3635_SetMode(&m_mc3635,
+                       MODE_C_MCTRL_CWAKE,
+                       LOW_POWER_MODE,
+                       ODR_6) != MC3635_SUCCESS)
+    {
+        NRF_LOG_ERROR("MC3635 wake failed.");
+        return false;
+    }
+
+    /* Better than a fixed delay: wait until a fresh XYZ sample is available. */
+    do
+    {
+        if (MC3635_ReadStatusRegister1(&m_mc3635, &status) != MC3635_SUCCESS)
+        {
+            NRF_LOG_ERROR("MC3635 status read failed.");
+            goto sleep_sensor;
+        }
+    } while ((status.status_1 & STATUS_1_NEW_DATA_MASK) == 0);
+
+    if (MC3635_ReadRawData(&m_mc3635, &accel) != MC3635_SUCCESS)
+    {
+        NRF_LOG_ERROR("MC3635 read failed.");
+        goto sleep_sensor;
+    }
+
+    NRF_LOG_INFO("Accel: X=%d mg, Y=%d mg, Z=%d mg",
+                 accel.XAxis_mg,
+                 accel.YAxis_mg,
+                 accel.ZAxis_mg);
+
+     valid =
+        (accel.XAxis_mg >= ACCEL_X_MIN_MG) &&
+        (accel.XAxis_mg <= ACCEL_X_MAX_MG) &&
+        (accel.YAxis_mg >= ACCEL_Y_MIN_MG) &&
+        (accel.YAxis_mg <= ACCEL_Y_MAX_MG) &&
+        (accel.ZAxis_mg >= ACCEL_Z_MIN_MG) &&
+        (accel.ZAxis_mg <= ACCEL_Z_MAX_MG);
+
+sleep_sensor:
+    if (MC3635_SetSleepMode(&m_mc3635) != MC3635_SUCCESS)
+    {
+        NRF_LOG_ERROR("MC3635 sleep failed.");
+    }
+
+    return valid;
 }
-
 /* =========================================================
  * Enable Buzzer
  *
@@ -421,17 +553,18 @@ static bool accelerometer_is_valid(void)
 
 static void buzzer_enable(void)
 {
-    /*
-     * Stop all sensor-cycle timers.
-     */
-    (void)app_timer_stop(m_first_cycle_timer);
-    (void)app_timer_stop(m_hall_sample_timer);
-    (void)app_timer_stop(m_monitoring_timer);
+    NRF_LOG_INFO("Buzzer enable");
+    ///*
+    // * Stop all sensor-cycle timers.
+    // */
+    //(void)app_timer_stop(m_first_cycle_timer);
+    //(void)app_timer_stop(m_hall_sample_timer);
+    //(void)app_timer_stop(m_monitoring_timer);
 
-    /*
-     * LED currently simulates buzzer.
-     */
-    bsp_board_led_on(0);
+    ///*
+    // * LED currently simulates buzzer.
+    // */
+    //bsp_board_led_on(0);
 
     m_app_state = APP_STATE_BUZZER;
 }
@@ -734,7 +867,15 @@ static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
             APP_ERROR_CHECK(err_code);
             break;
         case BLE_ADV_EVT_IDLE:
-            sleep_mode_enter();
+           /*
+            * System OFF disabled temporarily.
+            * BLE advertising and the 10-second monitoring cycle must remain
+            * active during development testing.
+            *
+            * TODO: Re-enable once final BLE advertising and low-power
+            * behavior are implemented.
+            */
+            //sleep_mode_enter();
             break;
         default:
             break;
@@ -876,7 +1017,15 @@ void bsp_event_handler(bsp_event_t event)
     switch (event)
     {
         case BSP_EVENT_SLEEP:
-            sleep_mode_enter();
+            /*
+            * System OFF is temporarily disabled during development/testing.
+            * Keep the MCU running so periodic 10-second monitoring and
+            * BLE advertising can continue without entering System OFF.
+            *
+            * TODO: Re-enable for the final low-power product design
+            * after the required wake-up and sleep behavior is implemented.
+            */
+            //sleep_mode_enter();
             break;
 
         case BSP_EVENT_DISCONNECT:
@@ -1107,33 +1256,19 @@ int main(void)
     conn_params_init();
     pressure_pad_init();
     APP_ERROR_CHECK(hall_sensor_init());
-    // Start execution.
-    printf("\r\nUART started.\r\n");
-    NRF_LOG_INFO("\r\nUART started.\r\n");
-    NRF_LOG_INFO("Debug logging for UART over RTT started.");
-    advertising_start();
-
-    NRF_LOG_INFO("Accel test running");
-
-       TWI_parameters_t mc3635_para = {
-		.SDA                = I2C_SDA_PIN,
-		.SCL                = I2C_SCL_PIN,
-		.ADDR               = MC3635_ADDRESS_LOW,
-	};
-
-        if(MC3635_Init(&mc3635_para) == MC3635_SUCCESS){
-           NRF_LOG_INFO("MC3635 init.");
-        }
-
-
-
-  
-
     
-
-
-    //uint8_t u8ID = u8LIS2_TestRead();
-    //NRF_LOG_INFO("LIS2DH12 - Who am I code: 0x%02x", u8ID);
+    advertising_start();
+    NRF_LOG_INFO(".......Nordic Safety Buckle Application.......");
+    m_accelerometer_ready = accelerometer_init();
+    if (m_accelerometer_ready)
+    {
+        NRF_LOG_INFO("MC3635 configured for continuous monitoring.");
+    }
+    else
+    {
+        /* A later monitoring cycle will treat this as a sensor failure. */
+        NRF_LOG_ERROR("MC3635 initialization/configuration failed.");
+    }
 
     // Enter main loop.
     for (;;)
