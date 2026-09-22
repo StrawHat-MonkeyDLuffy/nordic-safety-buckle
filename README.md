@@ -13,7 +13,16 @@
 - [x] Support pressure sensor with ADC
 - [x] Support Setup Button
 - [x] Support for Setup Mode and Operation Mode
-- 
+
+#### Setup Mode
+
+![Setup Mode](docs/images/setup_mode.png)
+
+#### Operating Mode
+
+![Operating Mode](docs/images/operating_mode.png)
+
+
 ### Pending
 - [ ] System Testing on product
 
