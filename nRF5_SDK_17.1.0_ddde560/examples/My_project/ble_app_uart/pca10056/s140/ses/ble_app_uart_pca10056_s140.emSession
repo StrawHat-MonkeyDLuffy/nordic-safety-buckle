@@ -48,7 +48,8 @@
  <Watch1>
   <Watches active="1" update="Never">
    <Watchpoint expression="err_code" name="err_code" radix="-1" linenumber="497" filename="../../../../../../components/libraries/bsp/bsp.c"/>
-   <Watchpoint expression="p_evt" name="p_evt" radix="16" linenumber="589" filename="../../../main.c"/>
+   <Watchpoint expression="p_evt" name="p_evt" radix="16" linenumber="2232" filename="../../../main.c"/>
+   <Watchpoint expression="hall_sensor_2_detected" name="hall_sensor_2_detected" radix="-1" linenumber="630" filename="../../../main.c"/>
   </Watches>
  </Watch1>
  <Watch2>
@@ -61,7 +62,7 @@
   <Watches active="0" update="Never"/>
  </Watch4>
  <Files>
-  <SessionOpenFile windowGroup="DockEditLeft" x="20" y="1253" useTextEdit="1" path="../../../main.c" left="0" selected="1" top="1236" codecName="Default"/>
+  <SessionOpenFile windowGroup="DockEditLeft" x="39" y="1078" useTextEdit="1" path="../../../main.c" left="0" selected="1" top="1057" codecName="Default"/>
  </Files>
- <EMStudioWindow activeProject="ble_app_uart_pca10056_s140" fileDialogDefaultFilter="*" autoConnectTarget="J-Link" buildConfiguration="Debug" sessionSettings="" debugSearchFileMap="" fileDialogInitialDirectory="C:/git/002-accelerometer-application-integration/nordic-safety-buckle/nRF5_SDK_17.1.0_ddde560/components/libraries/log/src" debugSearchPath="" autoConnectCapabilities="3711"/>
+ <EMStudioWindow activeProject="ble_app_uart_pca10056_s140" fileDialogDefaultFilter="*" autoConnectTarget="J-Link" buildConfiguration="Debug" sessionSettings="" debugSearchFileMap="" fileDialogInitialDirectory="C:/git/4-pressure-sensor-support-with-adc/nordic-safety-buckle/nRF5_SDK_17.1.0_ddde560/modules/nrfx/drivers/src" debugSearchPath="" autoConnectCapabilities="3711"/>
 </session>
