@@ -20,7 +20,7 @@
 
 #### Operating Mode
 
-![Operating Mode](docs/images/operating_mode.png)
+![Operating Mode](docs/images/operation_mode.png)
 
 
 ### Pending
