@@ -68,14 +68,15 @@
 #include "app_util_platform.h"
 #include "bsp_btn_ble.h"
 #include "nrf_pwr_mgmt.h"
+#include "nrf_gpio.h"
+#include "nrf_delay.h"
 
 #include "nrf_drv_gpiote.h"
 #include "nrf_drv_clock.h"
 #include "MC3635.h"
 #include "hall_sensor.h"
+#include "pressure_pad_adc.h"
 
-//#include "TWI.h"
-//#include "LIS2DH12.h"
 
 #if defined (UART_PRESENT)
 #include "nrf_uart.h"
@@ -125,79 +126,101 @@ static ble_uuid_t m_adv_uuids[]          =                                      
 };
 
 
+
+
 /* =========================================================
  * Application Configuration
  * ========================================================= */
-/*
- * Initial safe limits for functional testing. Calibrate these for the magnetic
- * field range that represents a valid installation before using in production.
- */
-#define HALL_DUTY_MIN_PER_MILLE   100U  /* 10.0 % */
-#define HALL_DUTY_MAX_PER_MILLE   900U  /* 90.0 % */
-#define FIRST_CYCLE_TIME_MS       10000U
-#define MONITORING_PERIOD_MS      10000U
-#define HALL_SAMPLE_PERIOD_MS     100U
+#define MONITORING_PERIOD_MS             10000U
+#define SWITCH_SAMPLE_PERIOD_MS          100U
+#define BOOT_SETUP_WINDOW_MS             30000U
+#define SETUP_TIMEOUT_MS                 60000U
+#define SWITCH_HOLD_TIME_MS              5000U
 
 /*
- * MC3635 installation limits.  These assume that the board is stationary
- * with Z aligned with gravity.  Record the values printed by
- * accelerometer_is_valid() on the installed product and tune these limits. (currenly set in maximum range for testing purpose as per range 2g = 2000mg)
- */
-#define ACCEL_X_MIN_MG    (-2000)
-#define ACCEL_X_MAX_MG    (2000)
-
-#define ACCEL_Y_MIN_MG    (-2000)
-#define ACCEL_Y_MAX_MG    (2000)
-
-#define ACCEL_Z_MIN_MG    (-2000)
-#define ACCEL_Z_MAX_MG    (2000)
-/*
- * TEMPORARY:
- * BUTTON_1 is being used as the pressure-pad input.
+ * Pressure-pad ADC threshold.
  *
- * Replace BUTTON_1 with the actual pressure-pad GPIO
- * when your custom board definition is ready.
+ * Set this to the calibrated ADC value that represents "pressure detected".
+ * The current implementation assumes pressure is detected when ADC >= threshold.
  */
-#define PRESSURE_PAD_PIN           NRF_GPIO_PIN_MAP(1,6)
+#define PRESSURE_SETUP_MIN_THRESHOLD    300
 
+/*
+ * The existing hall_sensor.c/h in the supplied project exposes one
+ * hall_sensor_measurement_get() API. Therefore the two setup/operating
+ * hall checkpoints are kept as separate application-level functions below.
+ *
+ * Replace the two functions with the actual Hall Sensor 1 / Hall Sensor 2
+ * channel APIs when those are available.
+ */
+#define HALL_DUTY_MIN_PER_MILLE           100U
+#define HALL_DUTY_MAX_PER_MILLE           900U
+
+/* MC3635 limits. Tune these with the installed-product measurements. */
+#define ACCEL_X_MIN_MG                    (-2000)
+#define ACCEL_X_MAX_MG                    (2000)
+#define ACCEL_Y_MIN_MG                    (-2000)
+#define ACCEL_Y_MAX_MG                    (2000)
+#define ACCEL_Z_MIN_MG                    (-2000)
+#define ACCEL_Z_MAX_MG                    (2000)
+
+/* Setup/wake switch. The Nordic BSP board definition supplies BUTTON_1. */
+#define SETUP_SWITCH_PIN                  BUTTON_1
+#define SETUP_SWITCH_ACTIVE_LEVEL         0
 
 /* =========================================================
  * Timers
  * ========================================================= */
-
-/* One-shot timer: defines the 10-second first-cycle duration */
-APP_TIMER_DEF(m_first_cycle_timer);
-
-/* Repeated timer: samples Hall during the first cycle */
-APP_TIMER_DEF(m_hall_sample_timer);
-
-/* Repeated timer: subsequent Hall + Accelerometer checks */
+APP_TIMER_DEF(m_boot_window_timer);
+APP_TIMER_DEF(m_setup_timeout_timer);
+APP_TIMER_DEF(m_switch_sample_timer);
+APP_TIMER_DEF(m_setup_sensor_timer);
 APP_TIMER_DEF(m_monitoring_timer);
 
 /* =========================================================
  * Application States
  * ========================================================= */
-
 typedef enum
 {
-    APP_STATE_SLEEP,
-    APP_STATE_FIRST_CYCLE,
-    APP_STATE_MONITORING,
+    APP_STATE_BOOT_CHECK,
+    APP_STATE_SETUP,
+    APP_STATE_OPERATING_SLEEP,
+    APP_STATE_OPERATING_MONITORING,
     APP_STATE_BUZZER
 
 } app_state_t;
 
+typedef enum
+{
+    SETUP_STEP_HALL_1,
+    SETUP_STEP_HALL_2,
+    SETUP_STEP_PRESSURE,
+    SETUP_STEP_COMPLETE
+
+} setup_step_t;
+
+typedef enum
+{
+    BUZZER_REASON_SETUP_TIMEOUT,
+    BUZZER_REASON_OPERATING_FAILURE
+
+} buzzer_reason_t;
+
 /* =========================================================
  * Application Variables
  * ========================================================= */
-
-static volatile bool m_first_cycle_timeout;
-static volatile bool m_hall_sample_timeout;
+static volatile bool m_boot_window_timeout;
+static volatile bool m_setup_timeout;
+static volatile bool m_switch_sample_timeout;
+static volatile bool m_setup_sensor_timeout;
 static volatile bool m_monitoring_timeout;
-static volatile bool m_pressure_event;
-static app_state_t m_app_state = APP_STATE_SLEEP;
 
-/* Kept globally because both initialization and the 10-second check use it. */
+static uint16_t m_switch_hold_ms;
+static setup_step_t m_setup_step = SETUP_STEP_HALL_1;
+static buzzer_reason_t m_buzzer_reason;
+static app_state_t m_app_state = APP_STATE_BOOT_CHECK;
+static int16_t m_pressure_threshold = 0;
+
 static TWI_parameters_t m_mc3635 =
 {
     .SDA  = I2C_SDA_PIN,
@@ -207,198 +230,153 @@ static TWI_parameters_t m_mc3635 =
 
 static bool m_accelerometer_ready;
 
-
-static void first_cycle_timer_handler(void * p_context);
-static void monitoring_timer_handler(void * p_context);
-static void hall_sample_timer_handler(void * p_context);
-
 /* =========================================================
- * Hall Sensor Sample Timer Handler
- *
- * Called every after 0.1 seconds.
+ * Timer Handlers
  * ========================================================= */
-
-static void hall_sample_timer_handler(void * p_context)
+static void boot_window_timer_handler(void * p_context)
 {
     (void)p_context;
-
-    m_hall_sample_timeout = true;
+    m_boot_window_timeout = true;
 }
 
-/* =========================================================
- * First Cycle Timer Handler
- *
- * Called once after 10 seconds.
- * ========================================================= */
-
-static void first_cycle_timer_handler(void * p_context)
+static void setup_timeout_timer_handler(void * p_context)
 {
     (void)p_context;
-
-    m_first_cycle_timeout = true;
+    m_setup_timeout = true;
 }
 
+static void switch_sample_timer_handler(void * p_context)
+{
+    (void)p_context;
+    m_switch_sample_timeout = true;
+}
 
-/* =========================================================
- * Monitoring Timer Handler
- *
- * Called every 10 seconds.
- * ========================================================= */
+static void setup_sensor_timer_handler(void * p_context)
+{
+    (void)p_context;
+    m_setup_sensor_timeout = true;
+}
 
 static void monitoring_timer_handler(void * p_context)
 {
     (void)p_context;
-
     m_monitoring_timeout = true;
 }
 
 /* =========================================================
- * GPIO Interrupt Handler
- *
- * BUTTON_1 currently simulates the Pressure Pad.
+ * Setup/Wake Switch
  * ========================================================= */
-
-static void pressure_pad_handler(
-    nrf_drv_gpiote_pin_t pin,
-    nrf_gpiote_polarity_t action)
+static bool setup_switch_is_pressed(void)
 {
-    (void)pin;
-    (void)action;
-
-    /*
-     * Pressure detected.
-     *
-     * Do not perform application processing here.
-     * Just set a flag.
-     */
-    m_pressure_event = true;
+    return (nrf_gpio_pin_read(SETUP_SWITCH_PIN) == SETUP_SWITCH_ACTIVE_LEVEL);
 }
 
-/* =========================================================
- * Initialize GPIOTE
- * ========================================================= */
-
-static void pressure_pad_init(void)
+static void setup_switch_init(void)
 {
-    ret_code_t err_code;
+    nrf_gpio_cfg_input(SETUP_SWITCH_PIN, NRF_GPIO_PIN_PULLUP);
+}
 
-    err_code = nrf_drv_gpiote_init();
-
-    /*
-     * NRF_ERROR_INVALID_STATE means
-     * GPIOTE is already initialized.
-     */
-    if (err_code != NRF_ERROR_INVALID_STATE)
+/*
+ * Returns true only after the switch has been continuously held for 5 s.
+ * The counter is intentionally reset when the switch is released.
+ */
+static bool setup_switch_held_for_5s(void)
+{
+    if (setup_switch_is_pressed())
     {
-        APP_ERROR_CHECK(err_code);
+        if (m_switch_hold_ms < SWITCH_HOLD_TIME_MS)
+        {
+            m_switch_hold_ms += SWITCH_SAMPLE_PERIOD_MS;
+        }
+
+        if (m_switch_hold_ms >= SWITCH_HOLD_TIME_MS)
+        {
+            return true;
+        }
+    }
+    else
+    {
+        m_switch_hold_ms = 0;
     }
 
-
-    /*
-     * HIGH -> LOW interrupt.
-     *
-     * Internal pull-up enabled.
-     *
-     * This is suitable for a button connected
-     * between GPIO and GND.
-     */
-    nrf_drv_gpiote_in_config_t config =
-        GPIOTE_CONFIG_IN_SENSE_HITOLO(true);
-
-    config.pull = NRF_GPIO_PIN_PULLUP;
-
-
-    APP_ERROR_CHECK(
-        nrf_drv_gpiote_in_init(
-            PRESSURE_PAD_PIN,
-            &config,
-            pressure_pad_handler
-        )
-    );
-
-
-    nrf_drv_gpiote_in_event_enable(
-        PRESSURE_PAD_PIN,
-        true
-    );
+    return false;
 }
 
-/**@brief Function for assert macro callback.
- *
- * @details This function will be called in case of an assert in the SoftDevice.
- *
- * @warning This handler is an example only and does not fit a final product. You need to analyse
- *          how your product is supposed to react in case of Assert.
- * @warning On assert from the SoftDevice, the system can only recover on reset.
- *
- * @param[in] line_num    Line number of the failing ASSERT call.
- * @param[in] p_file_name File name of the failing ASSERT call.
- */
-void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
+static void setup_switch_hold_reset(void)
 {
-    app_error_handler(DEAD_BEEF, line_num, p_file_name);
-}
-
-/**@brief Function for initializing the timer module.
- */
-static void timers_init(void)
-{
-    ret_code_t err_code = app_timer_init();
-    APP_ERROR_CHECK(err_code);
-
-    /*
-     * First-cycle duration timer.
-     *
-     * One-shot:
-     * expires after 10 seconds.
-     */
-    APP_ERROR_CHECK(
-        app_timer_create(
-            &m_first_cycle_timer,
-            APP_TIMER_MODE_SINGLE_SHOT,
-            first_cycle_timer_handler
-        )
-    );
-
-    /*
-     * Hall sampling timer.
-     *
-     * Repeated:
-     * Hall is checked every 100 ms
-     * during the first 10-second cycle.
-     */
-    APP_ERROR_CHECK(
-        app_timer_create(
-            &m_hall_sample_timer,
-            APP_TIMER_MODE_REPEATED,
-            hall_sample_timer_handler
-        )
-    );
-
-    /*
-     * Normal monitoring timer.
-     *
-     * Repeated:
-     * Hall + accelerometer every 10 seconds.
-     */
-    APP_ERROR_CHECK(
-        app_timer_create(
-            &m_monitoring_timer,
-            APP_TIMER_MODE_REPEATED,
-            monitoring_timer_handler
-        )
-    );
+    m_switch_hold_ms = 0;
 }
 
 /* =========================================================
- * Simulated Hall Sensor Check
+ * Buzzer
+ * =========================================================
  *
- * Later:
- * Replace this with PWM duty cycle measurement.
+ * IMPORTANT:
+ * The supplied main.c does not contain a real buzzer-driver API.
+ * The existing project used LED_1 as a buzzer placeholder.
+ *
+ * Keep these functions as the single integration point for the real
+ * buzzer driver.
+ */
+static void buzzer_enable(void)
+{
+    NRF_LOG_INFO("BUZZER: ON");
+
+    /* TODO: Replace with real buzzer driver enable. */
+    bsp_board_led_on(0);
+}
+
+static void buzzer_disable(void)
+{
+    NRF_LOG_INFO("BUZZER: OFF");
+
+    /* TODO: Replace with real buzzer driver disable. */
+    bsp_board_led_off(0);
+}
+
+/*
+ * Setup confirmation: three short beeps.
+ *
+ * Replace the LED timing with the real buzzer driver once available.
+ */
+static void buzzer_beep_3_times(void)
+{
+    NRF_LOG_INFO("BUZZER: 3 beeps");
+
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        buzzer_enable();
+        nrf_delay_ms(150);
+        buzzer_disable();
+
+        if (i < 2)
+        {
+            nrf_delay_ms(150);
+        }
+    }
+}
+
+/* =========================================================
+ * Hall Sensor
  * ========================================================= */
 
+/*
+ * Existing Hall API from the supplied main.c.
+ *
+ * This is the current generic Hall check. It should be replaced with
+ * Hall Sensor 1 and Hall Sensor 2 specific checks when the Hall driver
+ * exposes two independent channels.
+ */
 static bool hall_sensor_is_valid(void)
 {
+    /*
+     * IMPORTANT:
+     * The supplied main.c currently has the real Hall measurement code
+     * disabled and returns true. Keep the same behavior here so this file
+     * remains compatible with the current hall_sensor module.
+     *
+     * Replace this function with the real Hall detection implementation.
+     */
 #if 0
     hall_sensor_measurement_t measurement;
 
@@ -416,21 +394,81 @@ static bool hall_sensor_is_valid(void)
     return (measurement.duty_per_mille >= HALL_DUTY_MIN_PER_MILLE) &&
            (measurement.duty_per_mille <= HALL_DUTY_MAX_PER_MILLE);
 #endif
-return true; 
+    return true;
+}
+
+/*
+ * Application-level Hall Sensor 1 checkpoint.
+ * TODO: connect to Hall Sensor 1 driver/channel.
+ */
+static bool hall_sensor_1_detected(void)
+{
+    return hall_sensor_is_valid();
+}
+
+/*
+ * Application-level Hall Sensor 2 checkpoint.
+ * TODO: connect to Hall Sensor 2 driver/channel.
+ */
+static bool hall_sensor_2_detected(void)
+{
+    return hall_sensor_is_valid();
+}
+
+/* =========================================================
+ * Pressure Pad
+ * ========================================================= */
+static bool setup_pressure_detected(void)
+{
+    int16_t pressure = pressure_pad_adc_read();
+
+    NRF_LOG_INFO("Setup pressure ADC: %d", pressure);
+
+    if (pressure >= PRESSURE_SETUP_MIN_THRESHOLD)
+    {
+        /*
+         * Record the pressure detected during installation.
+         * This becomes the operating-mode threshold.
+         */
+        m_pressure_threshold = pressure;
+
+        NRF_LOG_INFO("Pressure threshold calibrated: %d",
+                     m_pressure_threshold);
+
+        return true;
+    }
+
+    return false;
 }
 
 
-/* =========================================================
- * MC3635 Accelerometer
- * ========================================================= */
+static bool pressure_pad_is_valid(void)
+{
+    int16_t pressure = pressure_pad_adc_read();
 
+    NRF_LOG_INFO("Operating pressure ADC: %d", pressure);
+
+    if (pressure < m_pressure_threshold)
+    {
+        NRF_LOG_WARNING(
+            "Pressure failure: %d < threshold %d",
+            pressure,
+            m_pressure_threshold);
+
+        return false;
+    }
+
+    return true;
+}
+
+/* =========================================================
+ * Accelerometer
+ * ========================================================= */
 static bool accelerometer_init(void)
 {
-    /* MC3635_Init configures the I2C peripheral only. */
     if (MC3635_Init(&m_mc3635) != MC3635_SUCCESS)
         return false;
 
-    /* All device configuration writes must be made from standby mode. */
     if (MC3635_SetStandbyMode(&m_mc3635) != MC3635_SUCCESS ||
         MC3635_InitializationSequence(&m_mc3635) != MC3635_SUCCESS ||
         MC3635_EnableAxis(&m_mc3635,
@@ -444,46 +482,8 @@ static bool accelerometer_init(void)
         return false;
     }
 
-    ///* Keep fresh XYZ data available for each 10-second monitoring cycle. */
-    //return MC3635_SetMode(&m_mc3635,
-    //                      MODE_C_MCTRL_CWAKE,
-    //                      LOW_POWER_MODE,
-    //                      ODR_6) == MC3635_SUCCESS;
-        return MC3635_SetSleepMode(&m_mc3635) == MC3635_SUCCESS;
+    return MC3635_SetSleepMode(&m_mc3635) == MC3635_SUCCESS;
 }
-
-//static bool accelerometer_is_valid(void)
-//{
-//    MC3635_data_t accel;
-
-//    if (!m_accelerometer_ready)
-//    {
-//        NRF_LOG_ERROR("MC3635 is not initialized.");
-//        return false;
-//    }
-
-//    if (MC3635_ReadRawData(&m_mc3635, &accel) != MC3635_SUCCESS)
-//    {
-//        NRF_LOG_ERROR("MC3635 read failed.");
-//        return false;
-//    }
-
-//    NRF_LOG_INFO("Accel: X=%d mg, Y=%d mg, Z=%d mg",
-//                 accel.XAxis_mg,
-//                 accel.YAxis_mg,
-//                 accel.ZAxis_mg);
-
-//    bool valid =
-//        (accel.XAxis_mg >= ACCEL_X_MIN_MG) &&
-//        (accel.XAxis_mg <= ACCEL_X_MAX_MG) &&
-//        (accel.YAxis_mg >= ACCEL_Y_MIN_MG) &&
-//        (accel.YAxis_mg <= ACCEL_Y_MAX_MG) &&
-//        (accel.ZAxis_mg >= ACCEL_Z_MIN_MG) &&
-//        (accel.ZAxis_mg <= ACCEL_Z_MAX_MG);
-
-//        return valid;
-
-//}
 
 static bool accelerometer_is_valid(void)
 {
@@ -497,7 +497,6 @@ static bool accelerometer_is_valid(void)
         return false;
     }
 
-    /* Wake sensor. SetMode() must be called from STANDBY. */
     if (MC3635_SetStandbyMode(&m_mc3635) != MC3635_SUCCESS ||
         MC3635_SetMode(&m_mc3635,
                        MODE_C_MCTRL_CWAKE,
@@ -508,7 +507,6 @@ static bool accelerometer_is_valid(void)
         return false;
     }
 
-    /* Better than a fixed delay: wait until a fresh XYZ sample is available. */
     do
     {
         if (MC3635_ReadStatusRegister1(&m_mc3635, &status) != MC3635_SUCCESS)
@@ -529,7 +527,7 @@ static bool accelerometer_is_valid(void)
                  accel.YAxis_mg,
                  accel.ZAxis_mg);
 
-     valid =
+    valid =
         (accel.XAxis_mg >= ACCEL_X_MIN_MG) &&
         (accel.XAxis_mg <= ACCEL_X_MAX_MG) &&
         (accel.YAxis_mg >= ACCEL_Y_MIN_MG) &&
@@ -544,109 +542,32 @@ sleep_sensor:
     }
 
     return valid;
-}
-/* =========================================================
- * Enable Buzzer
- *
- * LED_1 is currently used to simulate the buzzer.
- * ========================================================= */
 
-static void buzzer_enable(void)
-{
-    NRF_LOG_INFO("Buzzer enable");
-    ///*
-    // * Stop all sensor-cycle timers.
-    // */
-    //(void)app_timer_stop(m_first_cycle_timer);
-    //(void)app_timer_stop(m_hall_sample_timer);
-    //(void)app_timer_stop(m_monitoring_timer);
-
-    ///*
-    // * LED currently simulates buzzer.
-    // */
-    //bsp_board_led_on(0);
-
-    m_app_state = APP_STATE_BUZZER;
 }
 
 
-/* =========================================================
- * Disable Buzzer
- * ========================================================= */
-
-static void buzzer_disable(void)
-{
-    bsp_board_led_off(0);
-}
 
 /* =========================================================
- * Start First Cycle
+ * State Helpers
  * ========================================================= */
-
-static void start_first_cycle(void)
+static void monitoring_timer_stop(void)
 {
-    m_pressure_event = false;
-
-    m_first_cycle_timeout = false;
-    m_hall_sample_timeout = false;
-
-    m_app_state = APP_STATE_FIRST_CYCLE;
-
-    /*
-     * Start the 10-second first-cycle duration timer.
-     */
-    APP_ERROR_CHECK(
-        app_timer_start(
-            m_first_cycle_timer,
-            APP_TIMER_TICKS(FIRST_CYCLE_TIME_MS),
-            NULL
-        )
-    );
-
-    /*
-     * Start Hall sampling immediately.
-     *
-     * First Hall check will happen after 100 ms.
-     */
-    APP_ERROR_CHECK(
-        app_timer_start(
-            m_hall_sample_timer,
-            APP_TIMER_TICKS(HALL_SAMPLE_PERIOD_MS),
-            NULL
-        )
-    );
-
-    /*
-     * Do an immediate Hall check at 0 sec.
-     *
-     * This is important because the requirement says:
-     *
-     * Pressure detected
-     *      ↓
-     * Read Hall immediately
-     */
-    if (!hall_sensor_is_valid())
-    {
-        NRF_LOG_INFO("Hall sensor failed at start.");
-
-        buzzer_enable();
-    }
-}
-
-/* =========================================================
- * Start Monitoring Cycle
- * ========================================================= */
-
-static void start_monitoring(void)
-{
+    (void)app_timer_stop(m_monitoring_timer);
     m_monitoring_timeout = false;
+}
 
-    m_app_state = APP_STATE_MONITORING;
+static void enter_operating_mode(void)
+{
+    NRF_LOG_INFO("SETUP COMPLETE -> OPERATING MODE");
 
+    buzzer_disable();
+    (void)app_timer_stop(m_setup_timeout_timer);
+    (void)app_timer_stop(m_setup_sensor_timer);
+    m_setup_timeout = false;
+    m_setup_sensor_timeout = false;
+    monitoring_timer_stop();
 
-    /*
-     * Start repeated 10 second timer.
-     */
+    m_monitoring_timeout = false;
     APP_ERROR_CHECK(
         app_timer_start(
             m_monitoring_timer,
@@ -654,7 +575,250 @@ static void start_monitoring(void)
             NULL
         )
     );
+
+    /*
+     * First operating-mode check starts after 10 seconds.
+     */
+    m_app_state = APP_STATE_OPERATING_SLEEP;
 }
+
+static void start_setup_mode(void)
+{
+    NRF_LOG_INFO("========== ENTER SETUP MODE ==========");
+
+    buzzer_disable();
+    setup_switch_hold_reset();
+
+    (void)app_timer_stop(m_boot_window_timer);
+    (void)app_timer_stop(m_monitoring_timer);
+    (void)app_timer_stop(m_setup_sensor_timer);
+    m_monitoring_timeout = false;
+    m_setup_sensor_timeout = false;
+
+    m_setup_step = SETUP_STEP_HALL_1;
+    m_setup_timeout = false;
+
+    m_app_state = APP_STATE_SETUP;
+
+    APP_ERROR_CHECK(
+        app_timer_start(
+            m_setup_timeout_timer,
+            APP_TIMER_TICKS(SETUP_TIMEOUT_MS),
+            NULL
+        )
+    );
+
+    APP_ERROR_CHECK(
+        app_timer_start(
+            m_setup_sensor_timer,
+            APP_TIMER_TICKS(SWITCH_SAMPLE_PERIOD_MS),
+            NULL
+        )
+    );
+
+    NRF_LOG_INFO("SETUP: waiting for HALL SENSOR 1");
+}
+
+static void setup_mode_timeout(void)
+{
+    NRF_LOG_WARNING("SETUP FAILED: 60 second timeout");
+
+    (void)app_timer_stop(m_setup_timeout_timer);
+    (void)app_timer_stop(m_setup_sensor_timer);
+    m_setup_sensor_timeout = false;
+
+    m_buzzer_reason = BUZZER_REASON_SETUP_TIMEOUT;
+    m_app_state = APP_STATE_BUZZER;
+
+    buzzer_enable();
+}
+
+static void process_setup_step(void)
+{
+    switch (m_setup_step)
+    {
+        case SETUP_STEP_HALL_1:
+            if (hall_sensor_1_detected())
+            {
+                NRF_LOG_INFO("SETUP: HALL SENSOR 1 detected");
+                buzzer_beep_3_times();
+
+                m_setup_step = SETUP_STEP_HALL_2;
+                NRF_LOG_INFO("SETUP: waiting for HALL SENSOR 2");
+            }
+            break;
+
+        case SETUP_STEP_HALL_2:
+            if (hall_sensor_2_detected())
+            {
+                NRF_LOG_INFO("SETUP: HALL SENSOR 2 detected");
+                buzzer_beep_3_times();
+
+                m_setup_step = SETUP_STEP_PRESSURE;
+                NRF_LOG_INFO("SETUP: waiting for PRESSURE PAD");
+            }
+            break;
+
+        case SETUP_STEP_PRESSURE:
+            if (setup_pressure_detected())
+            {
+                NRF_LOG_INFO("SETUP: PRESSURE PAD detected");
+                buzzer_beep_3_times();
+
+                m_setup_step = SETUP_STEP_COMPLETE;
+                (void)app_timer_stop(m_setup_timeout_timer);
+                (void)app_timer_stop(m_setup_sensor_timer);
+                m_setup_sensor_timeout = false;
+
+                enter_operating_mode();
+            }
+            break;
+
+        case SETUP_STEP_COMPLETE:
+        default:
+            break;
+    }
+}
+
+static void enter_operating_sleep(void)
+{
+    /*
+     * "Sleep" here means the normal nRF power-management idle state.
+     * The monitoring timer remains active and wakes the MCU every 10 s.
+     */
+    m_app_state = APP_STATE_OPERATING_SLEEP;
+}
+
+static void start_monitoring_cycle(void)
+{
+    NRF_LOG_INFO("========== OPERATING CHECK ==========");
+
+    bool hall1_ok = hall_sensor_1_detected();
+    bool hall2_ok = hall_sensor_2_detected();
+    bool accel_ok = accelerometer_is_valid();
+    bool pressure_ok = pressure_pad_is_valid();
+
+    NRF_LOG_INFO("Operating check:\r\n H1_OK=%d H2_OK=%d ACCL_OK=%d PRESSURE_OK=%d",
+                 hall1_ok,
+                 hall2_ok,
+                 accel_ok,
+                 pressure_ok);
+
+    /*
+     * All operating conditions must be valid.
+     * If any condition fails, the buzzer remains continuously ON.
+     */
+    if (hall1_ok && hall2_ok && accel_ok && pressure_ok)
+    {
+        NRF_LOG_INFO("All operating conditions are OK.");
+
+        buzzer_disable();
+        enter_operating_sleep();
+    }
+    else
+    {
+        NRF_LOG_WARNING("Operating threshold failed.");
+
+        m_buzzer_reason = BUZZER_REASON_OPERATING_FAILURE;
+        m_app_state = APP_STATE_BUZZER;
+
+        buzzer_enable();
+    }
+}
+
+/*
+ * Called from APP_STATE_BUZZER.
+ *
+ * A 5-second button hold:
+ *   - turns the buzzer OFF
+ *   - restarts setup mode
+ */
+static void process_buzzer_state(void)
+{
+    if (m_switch_sample_timeout)
+    {
+        m_switch_sample_timeout = false;
+
+        if (setup_switch_held_for_5s())
+        {
+            NRF_LOG_INFO("5-second button hold detected.");
+            NRF_LOG_INFO("Restarting SETUP MODE and turning buzzer OFF.");
+
+            buzzer_disable();
+            setup_switch_hold_reset();
+
+            start_setup_mode();
+        }
+    }
+}
+
+/* =========================================================
+ * Timers Initialization
+ * ========================================================= */
+static void timers_init(void)
+{
+    ret_code_t err_code = app_timer_init();
+    APP_ERROR_CHECK(err_code);
+
+    APP_ERROR_CHECK(
+        app_timer_create(
+            &m_boot_window_timer,
+            APP_TIMER_MODE_SINGLE_SHOT,
+            boot_window_timer_handler
+        )
+    );
+
+    APP_ERROR_CHECK(
+        app_timer_create(
+            &m_setup_timeout_timer,
+            APP_TIMER_MODE_SINGLE_SHOT,
+            setup_timeout_timer_handler
+        )
+    );
+
+    APP_ERROR_CHECK(
+        app_timer_create(
+            &m_switch_sample_timer,
+            APP_TIMER_MODE_REPEATED,
+            switch_sample_timer_handler
+        )
+    );
+
+    APP_ERROR_CHECK(
+        app_timer_create(
+            &m_setup_sensor_timer,
+            APP_TIMER_MODE_REPEATED,
+            setup_sensor_timer_handler
+        )
+    );
+
+    APP_ERROR_CHECK(
+        app_timer_create(
+            &m_monitoring_timer,
+            APP_TIMER_MODE_REPEATED,
+            monitoring_timer_handler
+        )
+    );
+}
+
+/**@brief Function for assert macro callback.
+ *
+ * @details This function will be called in case of an assert in the SoftDevice.
+ *
+ * @warning This handler is an example only and does not fit a final product. You need to analyse
+ *          how your product is supposed to react in case of Assert.
+ * @warning On assert from the SoftDevice, the system can only recover on reset.
+ *
+ * @param[in] line_num    Line number of the failing ASSERT call.
+ * @param[in] p_file_name File name of the failing ASSERT call.
+ */
+void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
+{
+    app_error_handler(DEAD_BEEF, line_num, p_file_name);
+}
+
+
+
 
 /**@brief Function starting the internal LFCLK oscillator.
  *
@@ -1214,6 +1378,8 @@ static void power_management_init(void)
 
 
 /**@brief Function for handling the idle state (main loop).
+
+
  *
  * @details If there is no pending log operation, then sleep until next the next event occurs.
  */
@@ -1236,239 +1402,285 @@ static void advertising_start(void)
 
 
 /**@brief Application main function.
- */
+
+
+
+/**@brief Application main function. */
 int main(void)
 {
     bool erase_bonds;
 
-    // Initialize.
+    /* ---------------------------------------------------------
+     * Basic / Nordic initialization
+     * --------------------------------------------------------- */
     uart_init();
     log_init();
     lfclk_request();
     timers_init();
+
     buttons_leds_init(&erase_bonds);
     power_management_init();
+
     ble_stack_init();
     gap_params_init();
     gatt_init();
     services_init();
     advertising_init();
     conn_params_init();
-    pressure_pad_init();
+#if 1
+    /*
+     * The pressure pad is now ADC based.
+     * There is no GPIO interrupt for the pressure pad anymore.
+     */
+    APP_ERROR_CHECK(pressure_pad_adc_init());
+
     APP_ERROR_CHECK(hall_sensor_init());
-    
-    advertising_start();
-    NRF_LOG_INFO(".......Nordic Safety Buckle Application.......");
+
+    /*
+     * MC3635 is required by Operating Mode.
+     */
     m_accelerometer_ready = accelerometer_init();
+
     if (m_accelerometer_ready)
     {
-        NRF_LOG_INFO("MC3635 configured for continuous monitoring.");
+        NRF_LOG_INFO("MC3635 initialized.");
     }
     else
     {
-        /* A later monitoring cycle will treat this as a sensor failure. */
-        NRF_LOG_ERROR("MC3635 initialization/configuration failed.");
+        NRF_LOG_ERROR("MC3635 initialization failed.");
     }
+#endif
+    /*
+     * Setup/Wake switch is used for:
+     *   1. Entering Setup Mode after a 5 s hold at boot.
+     *   2. Restarting Setup Mode after a failure.
+     */
+    setup_switch_init();
 
-    // Enter main loop.
+    /*
+     * Switch sampling is kept active while the application is running.
+     *
+     * IMPORTANT: this timer is ONLY for the setup/wake button.
+     * Sensor polling in Setup Mode uses m_setup_sensor_timer.
+     */
+    APP_ERROR_CHECK(
+        app_timer_start(
+            m_switch_sample_timer,
+            APP_TIMER_TICKS(SWITCH_SAMPLE_PERIOD_MS),
+            NULL
+        )
+    );
+
+    /*
+     * At boot the application waits up to 30 s for the setup switch.
+     *
+     * If the switch is held continuously for 5 s:
+     *      -> Setup Mode
+     *
+     * If there is no setup activity for 30 s:
+     *      -> System OFF / sleep
+     */
+    m_app_state = APP_STATE_BOOT_CHECK;
+    m_boot_window_timeout = false;
+    setup_switch_hold_reset();
+
+    APP_ERROR_CHECK(
+        app_timer_start(
+            m_boot_window_timer,
+            APP_TIMER_TICKS(BOOT_SETUP_WINDOW_MS),
+            NULL
+        )
+    );
+
+    advertising_start();
+
+    NRF_LOG_INFO("==========================================");
+    NRF_LOG_INFO("Nordic Safety Buckle Application");
+    NRF_LOG_INFO("Application: Setup + Operating Mode");
+    NRF_LOG_INFO("==========================================");
+
+    /* ---------------------------------------------------------
+     * Main application loop
+     * --------------------------------------------------------- */
     for (;;)
     {
-      switch (m_app_state)
-      {
-          /* =================================================
-           * SLEEP STATE
-           *
-           * Waiting for Pressure Pad interrupt.
-           * ================================================= */
-          case APP_STATE_SLEEP:
-          {
-              if (m_pressure_event)
-              {
-                  NRF_LOG_INFO("Pressure event occurred.");
-      
-                  start_first_cycle();
-              }
-      
-              break;
-          }
-      
-      
-          /* =================================================
-           * FIRST CYCLE
-           *
-           * 0 - 10 seconds:
-           *
-           * Hall sensor is checked every 100 ms.
-           * No accelerometer check yet.
-           * ================================================= */
-          case APP_STATE_FIRST_CYCLE:
-          {
-              /*
-               * Hall sampling event.
-               */
-              if (m_hall_sample_timeout)
-              {
-                  m_hall_sample_timeout = false;
-      
-                  /*
-                   * Read/check Hall sensor.
-                   */
-                  if (!hall_sensor_is_valid())
-                  {
-                      NRF_LOG_INFO(
-                          "Hall sensor failed during first cycle."
-                      );
-      
-                      buzzer_enable();
-      
-                      /*
-                       * State is now APP_STATE_BUZZER.
-                       * No further FIRST_CYCLE processing
-                       * should be performed.
-                       */
-                      break;
-                  }else{
-                      NRF_LOG_INFO(
-                          "Reading Hall sensor during first cycle."
-                      );
-                  
-                  }
-              }
-      
-      
-              /*
-               * First 10-second period completed.
-               */
-              if (m_first_cycle_timeout)
-              {
-                  m_first_cycle_timeout = false;
-      
-                  /*
-                   * Stop 100 ms Hall sampling.
-                   */
-                  APP_ERROR_CHECK(
-                      app_timer_stop(m_hall_sample_timer)
-                  );
-      
-                  NRF_LOG_INFO(
-                      "First 10-second cycle completed."
-                  );
-      
-                  /*
-                   * Start normal monitoring.
-                   *
-                   * Hall + Accelerometer
-                   * every 10 seconds.
-                   */
-                  start_monitoring();
-              }
-      
-              break;
-          }
-      
-      
-          /* =================================================
-           * MONITORING STATE
-           *
-           * Every 10 seconds:
-           *
-           * 1. Read Hall
-           * 2. Read Accelerometer
-           * 3. Check both thresholds
-           * ================================================= */
-          case APP_STATE_MONITORING:
-          {
-              if (m_monitoring_timeout)
-              {
-                  m_monitoring_timeout = false;
-      
-                  NRF_LOG_INFO(
-                      "Entering monitoring cycle."
-                  );
-      
-                  bool hall_ok =
-                      hall_sensor_is_valid();
-      
-                  bool accelerometer_ok =
-                      accelerometer_is_valid();
-      
-      
-                  if (hall_ok && accelerometer_ok)
-                  {
-                      /*
-                       * Both sensors are OK.
-                       *
-                       * Return to sleep and wait
-                       * for the next pressure interrupt.
-                       */
-                      NRF_LOG_INFO(
-                          "Hall and accelerometer OK."
-                      );
-      
-                  }
-                  else
-                  {
-                      /*
-                       * One or both sensors failed.
-                       */
-                      NRF_LOG_INFO(
-                          "Sensor threshold failed."
-                      );
-      
-                      buzzer_enable();
-                  }
-              }
-      
-              break;
-          }
-      
-      
-          /* =================================================
-           * BUZZER STATE
-           *
-           * Buzzer remains ON until the required recovery
-           * condition is detected.
-           * ================================================= */
-          case APP_STATE_BUZZER:
-          {
-              /*
-               * Temporary:
-               * Buzzer remains ON.
-               *
-               * Later:
-               *
-               * if (hall_detected_again ||
-               *     motion_stopped ||
-               *     pressure_removed)
-               * {
-               *     buzzer_disable();
-               *     enter_sleep_state();
-               * }
-               */
-      
-              break;
-          }
-      
-      
-          /* =================================================
-           * DEFAULT
-           * ================================================= */
-          default:
-          {
-              /*
-               * Something corrupted the application state.
-               * Return to a known safe state.
-               */
-              NRF_LOG_ERROR(
-                  "Invalid application state: %d",
-                  m_app_state
-              );
-      
-              m_app_state = APP_STATE_SLEEP;
-              break;
-          }
-      }
-      
+        switch (m_app_state)
+        {
+            /* =================================================
+             * BOOT CHECK
+             *
+             * After boot/restart:
+             *   - Watch the setup/wake switch for 30 s.
+             *   - 5 s hold -> Setup Mode.
+             *   - No activity for 30 s -> System OFF.
+             * ================================================= */
+            case APP_STATE_BOOT_CHECK:
+            {
+                if (m_switch_sample_timeout)
+                {
+                    m_switch_sample_timeout = false;
+
+                    if (setup_switch_held_for_5s())
+                    {
+                        NRF_LOG_INFO("5-second switch hold detected at boot.");
+
+                        (void)app_timer_stop(m_boot_window_timer);
+                        setup_switch_hold_reset();
+
+                        start_setup_mode();
+                    }
+                }
+
+                if (m_boot_window_timeout)
+                {
+                    m_boot_window_timeout = false;
+
+                    NRF_LOG_INFO(
+                        "No setup switch activity for 30 s. Entering sleep."
+                    );
+
+                    /*
+                     * System OFF wakes through the configured BSP wake button.
+                     * Wake-up causes a reset, after which the 30 s boot check
+                     * is performed again.
+                     */
+                    sleep_mode_enter();
+                }
+
+                break;
+            }
+
+            /* =================================================
+             * SETUP MODE
+             *
+             * Required order:
+             *
+             *   1. Hall Sensor 1 -> 3 beeps
+             *   2. Hall Sensor 2 -> 3 beeps
+             *   3. Pressure Pad -> 3 beeps
+             *
+             * All three detections must complete within 60 s.
+             * ================================================= */
+            case APP_STATE_SETUP:
+            {
+                /*
+                 * The switch timer is ONLY for button sampling.
+                 * It must not be used to check Hall sensors or the
+                 * pressure pad.
+                 */
+                if (m_switch_sample_timeout)
+                {
+                    m_switch_sample_timeout = false;
+                    setup_switch_hold_reset();
+                }
+
+                /*
+                 * The setup sensor timer independently polls the
+                 * currently expected sensor every 100 ms.
+                 *
+                 * Example:
+                 *   HALL_1 detected -> move to HALL_2
+                 *   HALL_2 not detected -> remain in HALL_2
+                 *   HALL_2 detected at 40 s -> immediately move to PRESSURE
+                 */
+                if (m_setup_sensor_timeout)
+                {
+                    m_setup_sensor_timeout = false;
+                    process_setup_step();
+                }
+
+                /*
+                 * The 60-second setup timer is independent of sensor
+                 * polling. It limits the COMPLETE sequence, not each
+                 * individual sensor.
+                 */
+                if (m_setup_timeout)
+                {
+                    m_setup_timeout = false;
+
+                    if (m_setup_step != SETUP_STEP_COMPLETE)
+                    {
+                        setup_mode_timeout();
+                    }
+                }
+
+                break;
+            }
+
+            /* =================================================
+             * OPERATING SLEEP
+             *
+             * "Sleep" here is normal nRF idle/power-management sleep.
+             * The 10 s monitoring timer remains active.
+             * ================================================= */
+            case APP_STATE_OPERATING_SLEEP:
+            {
+                if (m_monitoring_timeout)
+                {
+                    m_monitoring_timeout = false;
+
+                    m_app_state = APP_STATE_OPERATING_MONITORING;
+                }
+
+                break;
+            }
+
+            /* =================================================
+             * OPERATING MONITORING
+             *
+             * Every 10 s check:
+             *
+             *   - Hall Sensor 1
+             *   - Hall Sensor 2
+             *   - Accelerometer
+             *   - Pressure pad released
+             *
+             * If ALL conditions are valid:
+             *      -> Sleep for the next 10 s
+             *
+             * If ANY condition fails:
+             *      -> Continuous buzzer
+             * ================================================= */
+            case APP_STATE_OPERATING_MONITORING:
+            {
+                start_monitoring_cycle();
+                break;
+            }
+
+            /* =================================================
+             * BUZZER
+             *
+             * Failure in Setup Mode:
+             *      -> buzzer remains ON
+             *      -> user holds switch for 5 s
+             *      -> buzzer OFF
+             *      -> Setup Mode restarts
+             *
+             * Failure in Operating Mode:
+             *      -> same recovery action
+             * ================================================= */
+            case APP_STATE_BUZZER:
+            {
+                process_buzzer_state();
+                break;
+            }
+
+            /* =================================================
+             * DEFAULT
+             * ================================================= */
+            default:
+            {
+                NRF_LOG_ERROR(
+                    "Invalid application state: %d",
+                    m_app_state
+                );
+
+                buzzer_disable();
+                m_app_state = APP_STATE_BOOT_CHECK;
+                break;
+            }
+        }
+
         idle_state_handle();
     }
 }

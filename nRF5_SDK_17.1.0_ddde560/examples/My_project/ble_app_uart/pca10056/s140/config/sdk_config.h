@@ -3435,7 +3435,7 @@
 // <e> NRFX_SAADC_ENABLED - nrfx_saadc - SAADC peripheral driver
 //==========================================================
 #ifndef NRFX_SAADC_ENABLED
-#define NRFX_SAADC_ENABLED 0
+#define NRFX_SAADC_ENABLED 1
 #endif
 // <o> NRFX_SAADC_CONFIG_RESOLUTION  - Resolution
  
@@ -4597,7 +4597,7 @@
 #endif
 // <o> NRFX_UART0_ENABLED - Enable UART0 instance 
 #ifndef NRFX_UART0_ENABLED
-#define NRFX_UART0_ENABLED 0
+#define NRFX_UART0_ENABLED 1
 #endif
 // <o> NRFX_UART1_ENABLED - Enable UART1 instance 
 #ifndef NRFX_UART1_ENABLED
@@ -5489,7 +5489,7 @@
 // <e> SAADC_ENABLED - nrf_drv_saadc - SAADC peripheral driver - legacy layer
 //==========================================================
 #ifndef SAADC_ENABLED
-#define SAADC_ENABLED 0
+#define SAADC_ENABLED 1
 #endif
 // <o> SAADC_CONFIG_RESOLUTION  - Resolution
  
@@ -7733,9 +7733,9 @@
 #ifndef NRF_LOG_BACKEND_UART_ENABLED
 #define NRF_LOG_BACKEND_UART_ENABLED 1
 #endif
-// <o> NRF_LOG_BACKEND_UART_TX_PIN - UART TX pin 
+// <o> NRF_LOG_BACKEND_UART_TX_PIN - UART TX pin (P1.02)
 #ifndef NRF_LOG_BACKEND_UART_TX_PIN
-#define NRF_LOG_BACKEND_UART_TX_PIN 6
+#define NRF_LOG_BACKEND_UART_TX_PIN 34
 #endif
 
 // <o> NRF_LOG_BACKEND_UART_BAUDRATE  - Default Baudrate
